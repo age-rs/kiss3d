@@ -12,6 +12,14 @@ EXAMPLES=(
     primitives
     primitives_scale
     primitives2d
+    blend_modes2d
+    sprites2d
+    post_processing2d
+    lighting2d
+    global_illumination2d
+    effect_chain2d
+    tilemap2d
+    skinning2d
     clustered_lights
     wireframe
     lines
@@ -71,6 +79,7 @@ EXAMPLES=(
     multi_windows
     ui
     inspector
+    robot_view
 )
 
 echo "Running ${#EXAMPLES[@]} kiss3d examples..."

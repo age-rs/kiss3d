@@ -21,17 +21,19 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::builtin::ObjectMaterial;
+    use crate::builtin::{Bone2d, LitParams, ObjectMaterial, SkinVertex2d, SkinnedMesh2d};
     use crate::camera::{CoordinateSystem2d, FixedView2d, OrbitCamera3d};
     use crate::context::Context;
     use crate::light::Light;
+    use crate::light2d::{Light2d, Light2dManager};
     use crate::post_processing::{
-        Cas, Fxaa, Grayscales, OculusStereo, PostProcessingEffect, SobelEdgeHighlight, Waves,
+        Cas, Crt, Fxaa, Gi2d, GiEmitter2d, GiOccluder2d, Grayscales, OculusStereo,
+        PostProcessingEffect, SobelEdgeHighlight, Waves,
     };
     use crate::renderer::RayTracer;
-    use crate::scene::{AlphaMode, SceneNode2d, SceneNode3d};
+    use crate::scene::{AlphaMode, SceneNode2d, SceneNode3d, SpriteSheet, Tilemap};
     use crate::window::OffscreenSurface;
-    use glamx::{Vec2, Vec3};
+    use glamx::{Pose2, Vec2, Vec3};
 
     use crate::color::Color;
 
@@ -108,7 +110,77 @@ mod tests {
         s.add_rectangle(50.0, 50.0)
             .set_lines_width(2.0, false)
             .set_position(Vec2::new(60.0, -40.0));
+        // A textured object exercises the `textured` über-shader variant (solid
+        // objects above use the default white texture → the untextured variant).
+        let tex = crate::resource::TextureManager::get_global_manager(|tm| {
+            tm.add_empty("shader_validity_tex")
+        });
+        let mut textured = s.add_rectangle(30.0, 30.0);
+        textured.data_mut().get_object_mut().set_texture(tex);
+        textured.set_position(Vec2::new(-90.0, -70.0));
+        // Non-default blend modes exercise the extra surface pipelines.
+        s.add_rectangle(40.0, 40.0)
+            .set_color(Color::new(0.8, 0.2, 0.2, 0.6))
+            .set_blend(crate::scene::Blend2d::Additive)
+            .set_position(Vec2::new(0.0, 70.0));
+        s.add_rectangle(40.0, 40.0)
+            .set_color(Color::new(0.2, 0.8, 0.2, 0.6))
+            .set_blend(crate::scene::Blend2d::Multiply)
+            .set_position(Vec2::new(20.0, 70.0));
+        // Sprite quad + 9-slice mesh (object2d shader, more vertices).
+        s.add_sprite(30.0, 30.0)
+            .set_position(Vec2::new(-60.0, 60.0));
+        s.add_nine_slice(
+            Vec2::new(60.0, 40.0),
+            crate::scene::Border::uniform(8.0),
+            crate::scene::Border::uniform(0.25),
+        )
+        .set_position(Vec2::new(-60.0, 0.0));
+        // Lit material (uses the default flat normal map + global 2D lights).
+        s.add_lit_sprite(40.0, 40.0)
+            .set_lit_params(LitParams::default().with_specular(0.5, 24.0))
+            .set_position(Vec2::new(80.0, 0.0));
+        // Tilemap mesh (atlas-textured single mesh, a few tiles set).
+        let mut tm = Tilemap::new(4, 4, Vec2::new(14.0, 14.0), SpriteSheet::new(2, 2));
+        tm.set_tile(0, 0, 0);
+        tm.set_tile(1, 1, 1);
+        tm.set_tile(2, 3, 2);
+        let mut tnode = tm.node();
+        tnode.set_position(Vec2::new(-90.0, 70.0));
+        s.add_child(tnode);
         s
+    }
+
+    /// A small 3-bone vertical strip skinned mesh.
+    fn demo_skinned_mesh() -> SkinnedMesh2d {
+        let mut verts = Vec::new();
+        for row in 0..3u32 {
+            for &x in &[-12.0f32, 12.0] {
+                verts.push(SkinVertex2d {
+                    position: Vec2::new(x, row as f32 * 30.0),
+                    uv: Vec2::new((x + 12.0) / 24.0, row as f32 / 2.0),
+                    joints: [row, 0, 0, 0],
+                    weights: [1.0, 0.0, 0.0, 0.0],
+                });
+            }
+        }
+        // Two quads (rows 0-1 and 1-2).
+        let faces = vec![[0, 1, 3], [0, 3, 2], [2, 3, 5], [2, 5, 4]];
+        let bones = vec![
+            Bone2d {
+                parent: None,
+                local: Pose2::IDENTITY,
+            },
+            Bone2d {
+                parent: Some(0),
+                local: Pose2::from_translation(Vec2::new(0.0, 30.0)),
+            },
+            Bone2d {
+                parent: Some(1),
+                local: Pose2::from_translation(Vec2::new(0.0, 30.0)),
+            },
+        ];
+        SkinnedMesh2d::new(verts, faces, bones)
     }
 
     #[test]
@@ -155,10 +227,87 @@ mod tests {
                 surface.render_3d(&mut scene, &mut cam).await;
             }
 
-            // 3) 2D scene (object2d / points2d / polyline2d / wireframe).
+            // 3) 2D scene (object2d / points2d / polyline2d / wireframe / sdf2d / lit2d).
+            Light2dManager::get_global_manager(|m| {
+                m.set_ambient(Color::new(0.1, 0.1, 0.12, 1.0));
+                m.set_lights(&[
+                    Light2d::point(
+                        Vec2::new(80.0, 30.0),
+                        Color::new(1.0, 0.9, 0.8, 1.0),
+                        2.0,
+                        200.0,
+                    ),
+                    Light2d::spot(
+                        Vec2::new(40.0, 60.0),
+                        Vec2::new(0.0, -1.0),
+                        Color::new(0.6, 0.8, 1.0, 1.0),
+                        2.0,
+                        180.0,
+                        0.3,
+                        0.6,
+                    ),
+                ]);
+            });
             let mut cam2 = FixedView2d::new(CoordinateSystem2d::default(), false);
             let mut scene2 = demo_scene_2d();
+            // Skinned 2D mesh: a 3-bone vertical strip, posed and rendered.
+            let mut skinned = demo_skinned_mesh();
+            skinned.set_bone_local(1, Pose2::new(Vec2::new(0.0, 60.0), 0.3));
+            skinned.update();
+            let mut snode = skinned.node();
+            snode.set_position(Vec2::new(-40.0, -30.0));
+            scene2.add_child(snode);
             surface.render_2d(&mut scene2, &mut cam2).await;
+
+            // GI with the jump-flood occluder SDF path (seed / step / resolve shaders).
+            {
+                let mut gi = Gi2d::new();
+                gi.set_sdf_occluders(true);
+                gi.set_camera(&cam2);
+                gi.set_occluders(&[GiOccluder2d::new(Vec2::ZERO, 20.0)]);
+                gi.set_emitters(&[GiEmitter2d::new(
+                    Vec2::new(40.0, 0.0),
+                    8.0,
+                    Color::new(1.0, 0.9, 0.7, 1.0),
+                    2.0,
+                )]);
+                surface
+                    .render(
+                        None,
+                        Some(&mut scene2),
+                        None,
+                        Some(&mut cam2),
+                        None,
+                        Some(&mut gi),
+                    )
+                    .await;
+            }
+
+            // GI via the radiance-cascade solver (cascade + cascade-composite shaders).
+            {
+                let mut gi = Gi2d::new();
+                gi.set_radiance_cascades(true);
+                gi.set_cascade_count(4);
+                gi.set_sdf_occluders(true); // exercises the SDF-cascade march path
+                gi.set_camera(&cam2);
+                gi.set_occluders(&[GiOccluder2d::new(Vec2::ZERO, 20.0)]);
+                gi.set_emitters(&[GiEmitter2d::new(
+                    Vec2::new(60.0, 0.0),
+                    10.0,
+                    Color::new(1.0, 0.9, 0.7, 1.0),
+                    2.0,
+                )]);
+                surface
+                    .render(
+                        None,
+                        Some(&mut scene2),
+                        None,
+                        Some(&mut cam2),
+                        None,
+                        Some(&mut gi),
+                    )
+                    .await;
+            }
 
             // 4) Path tracer (rt_kernel / denoise / rt tonemap).
             let mut rt = RayTracer::new();
@@ -173,6 +322,8 @@ mod tests {
                 Box::new(Grayscales::new()),
                 Box::new(Waves::new()),
                 Box::new(OculusStereo::new()),
+                Box::new(Crt::new()),
+                Box::new(Gi2d::new()),
             ];
             for eff in &mut effects {
                 surface
@@ -183,6 +334,24 @@ mod tests {
                         None,
                         None,
                         Some(eff.as_mut()),
+                    )
+                    .await;
+            }
+
+            // 6) Chained post-processing (exercises the ping-pong path: resolve → A,
+            // effect 0 A→B, effect 1 B→frame).
+            {
+                let mut a = Fxaa::new();
+                let mut b = Crt::new();
+                let mut chain: [&mut dyn PostProcessingEffect; 2] = [&mut a, &mut b];
+                surface
+                    .render_chain(
+                        Some(&mut scene),
+                        None,
+                        Some(&mut cam),
+                        None,
+                        None,
+                        &mut chain,
                     )
                     .await;
             }

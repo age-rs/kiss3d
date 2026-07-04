@@ -3,13 +3,65 @@ use crate::context::Context;
 use crate::resource::vertex_index::VERTEX_INDEX_FORMAT;
 use crate::resource::{
     multisample_state, DynamicUniformBuffer, GpuData, GpuMesh2d, Material2d, PipelineCache,
-    RenderContext2d, Texture,
+    RenderContext2d, Texture, TextureManager,
 };
-use crate::scene::{InstancesBuffer2d, ObjectData2d};
+use crate::scene::{Blend2d, InstancesBuffer2d, ObjectData2d};
 use bytemuck::{Pod, Zeroable};
 use glamx::{Mat2, Mat3, Pose2, Vec2};
 use std::any::Any;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+use std::rc::Rc;
+use std::sync::Arc;
+
+/// Conditional-compilation features for the 2D object shader (`object2d.wgsl`).
+///
+/// Each bit maps to a WESL `@if(...)` flag; a per-object mask selects a specialized
+/// shader variant so unused paths (and their texture bindings) are stripped, raising
+/// GPU occupancy. The pipeline layout is shared across variants — stripped bindings
+/// simply go unused — so all variants reuse the same bind groups.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub(crate) struct ShaderFeatures2d(u32);
+
+impl ShaderFeatures2d {
+    /// The object samples a texture (vs. a solid color using the default white texture).
+    const TEXTURED: u32 = 1 << 0;
+
+    /// `(WESL feature name, bit)` — names MUST match the `@if(...)` flags in `object2d.wgsl`.
+    const TABLE: [(&'static str, u32); 1] = [("textured", Self::TEXTURED)];
+
+    #[inline]
+    fn with(mut self, bit: u32, on: bool) -> Self {
+        if on {
+            self.0 |= bit;
+        } else {
+            self.0 &= !bit;
+        }
+        self
+    }
+
+    #[inline]
+    fn has(self, bit: u32) -> bool {
+        self.0 & bit != 0
+    }
+}
+
+/// Compiles `object2d.wgsl` to specialized WGSL for `features` via WESL conditional
+/// translation; dead-code elimination then strips the unused paths and bindings.
+fn compile_object2d_wgsl(features: ShaderFeatures2d) -> String {
+    let feats: Vec<(&str, bool)> = ShaderFeatures2d::TABLE
+        .iter()
+        .map(|(name, bit)| (*name, features.has(*bit)))
+        .collect();
+    crate::builtin::compile_wesl(
+        &[
+            ("package::object2d", include_str!("object2d.wgsl")),
+            ("package::common", crate::builtin::COMMON_WESL),
+        ],
+        "package::object2d",
+        &feats,
+    )
+}
 
 /// Frame-level uniforms (view, projection) for 2D rendering.
 #[repr(C)]
@@ -298,7 +350,16 @@ impl GpuData for ObjectMaterial2dGpuData {
 /// - Object uniforms are accumulated in a dynamic buffer and flushed once
 /// - This significantly reduces the number of `write_buffer` calls per frame
 pub struct ObjectMaterial2d {
-    pipeline: PipelineCache,
+    /// Pipeline layout shared by every surface-shader variant (group 0 frame, group 1
+    /// object, group 2 texture); unused bindings in a stripped variant simply go unused.
+    surface_pipeline_layout: wgpu::PipelineLayout,
+    /// Specialized surface shader modules, compiled lazily and cached per feature mask.
+    surface_shaders: RefCell<HashMap<ShaderFeatures2d, Rc<wgpu::ShaderModule>>>,
+    /// Specialized surface pipelines, keyed by `(blend mode, features, sample count)`.
+    surface_pipelines: RefCell<HashMap<(Blend2d, ShaderFeatures2d, u32), Rc<wgpu::RenderPipeline>>>,
+    /// The global default (white) texture; an object still using it gets the
+    /// untextured shader variant.
+    default_texture: Arc<Texture>,
     object_bind_group_layout: wgpu::BindGroupLayout,
     texture_bind_group_layout: wgpu::BindGroupLayout,
     // Wireframe pipeline and layouts
@@ -391,128 +452,19 @@ impl ObjectMaterial2d {
                 ],
             });
 
-        let pipeline_layout = ctxt.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("planar_material_pipeline_layout"),
-            bind_group_layouts: &[
-                Some(&frame_bind_group_layout),
-                Some(&object_bind_group_layout),
-                Some(&texture_bind_group_layout),
-            ],
-            immediate_size: 0,
-        });
+        let surface_pipeline_layout =
+            ctxt.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("planar_material_pipeline_layout"),
+                bind_group_layouts: &[
+                    Some(&frame_bind_group_layout),
+                    Some(&object_bind_group_layout),
+                    Some(&texture_bind_group_layout),
+                ],
+                immediate_size: 0,
+            });
 
-        // Load shader
-        let shader = ctxt.create_shader_module(
-            Some("planar_material_shader"),
-            &crate::builtin::compile_shader_with_common(
-                "package::object2d",
-                include_str!("object2d.wgsl"),
-            ),
-        );
-
-        // Main 2D surface pipeline, built lazily per MSAA sample count (2D content
-        // renders into the optionally-multisampled HDR film).
-        let pipeline = PipelineCache::new(move |sample_count| {
-            let ctxt = Context::get();
-            // Vertex buffer layouts
-            // Note: We use separate buffers for instance data (positions, colors, deformations)
-            // instead of interleaving them, to avoid per-frame data conversion overhead.
-            let vertex_buffer_layouts = [
-                // Buffer 0: Vertex positions (vec2)
-                wgpu::VertexBufferLayout {
-                    array_stride: std::mem::size_of::<[f32; 2]>() as wgpu::BufferAddress,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &[wgpu::VertexAttribute {
-                        offset: 0,
-                        shader_location: 0,
-                        format: wgpu::VertexFormat::Float32x2,
-                    }],
-                },
-                // Buffer 1: Texture coordinates (vec2)
-                wgpu::VertexBufferLayout {
-                    array_stride: std::mem::size_of::<[f32; 2]>() as wgpu::BufferAddress,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &[wgpu::VertexAttribute {
-                        offset: 0,
-                        shader_location: 1,
-                        format: wgpu::VertexFormat::Float32x2,
-                    }],
-                },
-                // Buffer 2: Instance positions (Point2<f32>)
-                wgpu::VertexBufferLayout {
-                    array_stride: std::mem::size_of::<[f32; 2]>() as wgpu::BufferAddress,
-                    step_mode: wgpu::VertexStepMode::Instance,
-                    attributes: &[wgpu::VertexAttribute {
-                        offset: 0,
-                        shader_location: 2, // inst_tra
-                        format: wgpu::VertexFormat::Float32x2,
-                    }],
-                },
-                // Buffer 3: Instance colors ([f32; 4])
-                wgpu::VertexBufferLayout {
-                    array_stride: std::mem::size_of::<[f32; 4]>() as wgpu::BufferAddress,
-                    step_mode: wgpu::VertexStepMode::Instance,
-                    attributes: &[wgpu::VertexAttribute {
-                        offset: 0,
-                        shader_location: 3, // inst_color
-                        format: wgpu::VertexFormat::Float32x4,
-                    }],
-                },
-                // Buffer 4: Instance deformations (2x Vector2<f32> = 2 columns of 2x2 matrix)
-                wgpu::VertexBufferLayout {
-                    array_stride: std::mem::size_of::<[f32; 4]>() as wgpu::BufferAddress, // 2 vec2s
-                    step_mode: wgpu::VertexStepMode::Instance,
-                    attributes: &[
-                        // inst_def_0 (column 0)
-                        wgpu::VertexAttribute {
-                            offset: 0,
-                            shader_location: 4,
-                            format: wgpu::VertexFormat::Float32x2,
-                        },
-                        // inst_def_1 (column 1)
-                        wgpu::VertexAttribute {
-                            offset: 8, // 2 * sizeof(f32)
-                            shader_location: 5,
-                            format: wgpu::VertexFormat::Float32x2,
-                        },
-                    ],
-                },
-            ];
-
-            ctxt.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("planar_material_pipeline"),
-                layout: Some(&pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: Some("vs_main"),
-                    buffers: &vertex_buffer_layouts,
-                    compilation_options: Default::default(),
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: Some("fs_main"),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: Context::render_format(), // HDR rasterization target (tonemapped to LDR in the resolve pass)
-                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                    compilation_options: Default::default(),
-                }),
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleList,
-                    strip_index_format: None,
-                    front_face: wgpu::FrontFace::Ccw,
-                    cull_mode: None, // 2D objects typically don't need culling
-                    polygon_mode: wgpu::PolygonMode::Fill,
-                    unclipped_depth: false,
-                    conservative: false,
-                },
-                depth_stencil: None, // 2D rendering typically doesn't use depth
-                multisample: multisample_state(sample_count),
-                multiview_mask: None,
-                cache: None,
-            })
-        });
+        // Surface shader variants and pipelines are compiled lazily on first use,
+        // keyed by feature mask (textured vs. solid) / blend mode / MSAA sample count.
 
         // Create wireframe bind group layouts
         let wireframe_view_bind_group_layout =
@@ -882,7 +834,10 @@ impl ObjectMaterial2d {
         });
 
         ObjectMaterial2d {
-            pipeline,
+            surface_pipeline_layout,
+            surface_shaders: RefCell::new(HashMap::new()),
+            surface_pipelines: RefCell::new(HashMap::new()),
+            default_texture: TextureManager::get_global_manager(|tm| tm.get_default()),
             object_bind_group_layout,
             texture_bind_group_layout,
             wireframe_pipeline,
@@ -897,6 +852,143 @@ impl ObjectMaterial2d {
             object_bind_group: Some(object_bind_group),
             frame_counter: Cell::new(0),
             last_frame: Cell::new(u64::MAX),
+        }
+    }
+
+    /// Returns the specialized surface shader module for `features`, compiling and
+    /// caching it on first use (WESL `@if` strips unused paths/bindings per variant).
+    fn surface_shader(&self, features: ShaderFeatures2d) -> Rc<wgpu::ShaderModule> {
+        if let Some(m) = self.surface_shaders.borrow().get(&features) {
+            return m.clone();
+        }
+        let wgsl = compile_object2d_wgsl(features);
+        let module =
+            Rc::new(Context::get().create_shader_module(Some("planar_material_shader"), &wgsl));
+        self.surface_shaders
+            .borrow_mut()
+            .insert(features, module.clone());
+        module
+    }
+
+    /// Returns the surface pipeline for `(blend, features, sample_count)`, building and
+    /// caching it on first use. All variants share `surface_pipeline_layout`.
+    fn surface_pipeline(
+        &self,
+        blend: Blend2d,
+        features: ShaderFeatures2d,
+        sample_count: u32,
+    ) -> Rc<wgpu::RenderPipeline> {
+        let key = (blend, features, sample_count);
+        if let Some(p) = self.surface_pipelines.borrow().get(&key) {
+            return p.clone();
+        }
+        let shader = self.surface_shader(features);
+        let ctxt = Context::get();
+        {
+            // Vertex buffer layouts
+            // Note: We use separate buffers for instance data (positions, colors, deformations)
+            // instead of interleaving them, to avoid per-frame data conversion overhead.
+            let vertex_buffer_layouts = [
+                // Buffer 0: Vertex positions (vec2)
+                wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<[f32; 2]>() as wgpu::BufferAddress,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &[wgpu::VertexAttribute {
+                        offset: 0,
+                        shader_location: 0,
+                        format: wgpu::VertexFormat::Float32x2,
+                    }],
+                },
+                // Buffer 1: Texture coordinates (vec2)
+                wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<[f32; 2]>() as wgpu::BufferAddress,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &[wgpu::VertexAttribute {
+                        offset: 0,
+                        shader_location: 1,
+                        format: wgpu::VertexFormat::Float32x2,
+                    }],
+                },
+                // Buffer 2: Instance positions (Point2<f32>)
+                wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<[f32; 2]>() as wgpu::BufferAddress,
+                    step_mode: wgpu::VertexStepMode::Instance,
+                    attributes: &[wgpu::VertexAttribute {
+                        offset: 0,
+                        shader_location: 2, // inst_tra
+                        format: wgpu::VertexFormat::Float32x2,
+                    }],
+                },
+                // Buffer 3: Instance colors ([f32; 4])
+                wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<[f32; 4]>() as wgpu::BufferAddress,
+                    step_mode: wgpu::VertexStepMode::Instance,
+                    attributes: &[wgpu::VertexAttribute {
+                        offset: 0,
+                        shader_location: 3, // inst_color
+                        format: wgpu::VertexFormat::Float32x4,
+                    }],
+                },
+                // Buffer 4: Instance deformations (2x Vector2<f32> = 2 columns of 2x2 matrix)
+                wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<[f32; 4]>() as wgpu::BufferAddress, // 2 vec2s
+                    step_mode: wgpu::VertexStepMode::Instance,
+                    attributes: &[
+                        // inst_def_0 (column 0)
+                        wgpu::VertexAttribute {
+                            offset: 0,
+                            shader_location: 4,
+                            format: wgpu::VertexFormat::Float32x2,
+                        },
+                        // inst_def_1 (column 1)
+                        wgpu::VertexAttribute {
+                            offset: 8, // 2 * sizeof(f32)
+                            shader_location: 5,
+                            format: wgpu::VertexFormat::Float32x2,
+                        },
+                    ],
+                },
+            ];
+
+            let pipeline = Rc::new(
+                ctxt.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some("planar_material_pipeline"),
+                    layout: Some(&self.surface_pipeline_layout),
+                    vertex: wgpu::VertexState {
+                        module: &shader,
+                        entry_point: Some("vs_main"),
+                        buffers: &vertex_buffer_layouts,
+                        compilation_options: Default::default(),
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &shader,
+                        entry_point: Some("fs_main"),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format: Context::render_format(), // HDR rasterization target (tonemapped to LDR in the resolve pass)
+                            blend: blend.blend_state(),
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                        compilation_options: Default::default(),
+                    }),
+                    primitive: wgpu::PrimitiveState {
+                        topology: wgpu::PrimitiveTopology::TriangleList,
+                        strip_index_format: None,
+                        front_face: wgpu::FrontFace::Ccw,
+                        cull_mode: None, // 2D objects typically don't need culling
+                        polygon_mode: wgpu::PolygonMode::Fill,
+                        unclipped_depth: false,
+                        conservative: false,
+                    },
+                    depth_stencil: None, // 2D rendering typically doesn't use depth
+                    multisample: multisample_state(sample_count),
+                    multiview_mask: None,
+                    cache: None,
+                }),
+            );
+            self.surface_pipelines
+                .borrow_mut()
+                .insert(key, pipeline.clone());
+            pipeline
         }
     }
 
@@ -1438,7 +1530,11 @@ impl Material2d for ObjectMaterial2d {
             };
             let object_bind_group = self.object_bind_group.as_ref().unwrap();
 
-            let pipeline = self.pipeline.get(context.sample_count);
+            // Specialize the shader: objects still using the default white texture
+            // get the untextured variant (no texture sample), the rest the textured one.
+            let textured = !Arc::ptr_eq(data.texture(), &self.default_texture);
+            let features = ShaderFeatures2d::default().with(ShaderFeatures2d::TEXTURED, textured);
+            let pipeline = self.surface_pipeline(data.blend(), features, context.sample_count);
             render_pass.set_pipeline(&pipeline);
             render_pass.set_bind_group(0, &self.frame_bind_group, &[]);
             // Use dynamic offset for object uniforms!

@@ -99,7 +99,14 @@ pub struct Window {
     /// the resolved scene each frame that contains refractive surfaces.
     pub(super) transmission: Option<crate::renderer::Transmission>,
     pub(super) transmission_enabled: bool,
+    /// Single-sample OIT targets for the planar-reflector capture pass, so
+    /// transparent surfaces appear in mirrors. Created on first use.
+    pub(super) reflector_oit: Option<crate::renderer::ReflectorOit>,
     pub(super) post_process_render_target: RenderTarget,
+    /// Second LDR target, paired with `post_process_render_target` as ping-pong
+    /// buffers when chaining more than one post-processing effect: each effect reads
+    /// one and writes the other, and the last writes the final frame.
+    pub(super) post_process_render_target_b: RenderTarget,
     /// Offscreen render target used when the window is hidden, so `snap` and
     /// recording work without a presentable surface. Created on first use.
     pub(super) offscreen_output_target: Option<RenderTarget>,
@@ -987,7 +994,7 @@ impl Window {
         let mut usr_window = Window {
             should_close: false,
             first_frame: true,
-            close_key: Some(Key::Escape),
+            close_key: None,
             close_modifiers: None,
             last_timings: None,
             last_frame_instant: None,
@@ -1021,7 +1028,10 @@ impl Window {
             dof_enabled: false,
             transmission: None,
             transmission_enabled: true,
+            reflector_oit: None,
             post_process_render_target: framebuffer_manager.new_render_target(width, height, true),
+            post_process_render_target_b: framebuffer_manager
+                .new_render_target(width, height, false),
             offscreen_output_target: None,
             aov_renderer: None,
             hidden: hide,
@@ -1042,7 +1052,6 @@ impl Window {
 
     /// Creates a headless window: a render target backed by no actual window,
     /// for off-screen rendering. Powers [`OffscreenSurface`](crate::window::OffscreenSurface).
-    #[cfg(not(target_arch = "wasm32"))]
     pub(super) async fn do_new_headless(
         width: u32,
         height: u32,
@@ -1096,7 +1105,10 @@ impl Window {
             dof_enabled: false,
             transmission: None,
             transmission_enabled: true,
+            reflector_oit: None,
             post_process_render_target: framebuffer_manager.new_render_target(width, height, true),
+            post_process_render_target_b: framebuffer_manager
+                .new_render_target(width, height, false),
             offscreen_output_target: None,
             aov_renderer: None,
             // A headless window has no surface; always render off-screen.

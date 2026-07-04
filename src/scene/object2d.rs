@@ -14,6 +14,76 @@ use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
 
+/// How a 2D object's surface is composited over what is already in the framebuffer.
+///
+/// The surface pass of [`ObjectMaterial2d`](crate::builtin::ObjectMaterial2d) builds
+/// one pipeline variant per blend mode (lazily, keyed by MSAA sample count), so
+/// switching an object's blend mode is free beyond the first use of that variant.
+/// Wireframe and point overlays always use straight alpha blending.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Default)]
+pub enum Blend2d {
+    /// Straight (non-premultiplied) alpha blending: `src.rgb * src.a + dst.rgb * (1 - src.a)`.
+    /// The default, matching ordinary transparent sprites.
+    #[default]
+    Alpha,
+    /// Premultiplied alpha: `src.rgb + dst.rgb * (1 - src.a)`. Correct for textures
+    /// whose color is already multiplied by their alpha (avoids dark edge fringing).
+    PremultipliedAlpha,
+    /// Additive blending: `src.rgb * src.a + dst.rgb`. Light-emitting effects — fire,
+    /// sparks, glows, lasers — that should only ever brighten the background.
+    Additive,
+    /// Multiplicative blending: `src.rgb * dst.rgb`. Shadows, tints and stains that
+    /// darken the background.
+    Multiply,
+    /// Screen blending: `src.rgb + dst.rgb * (1 - src.rgb)`. A softer brightening than
+    /// additive that never blows past white.
+    Screen,
+    /// No blending: the source overwrites the destination (alpha is still written).
+    Opaque,
+}
+
+impl Blend2d {
+    /// The wgpu blend state realizing this mode for a straight-(non-premultiplied)
+    /// color target, or `None` for [`Blend2d::Opaque`] (blending disabled).
+    pub(crate) fn blend_state(self) -> Option<wgpu::BlendState> {
+        use wgpu::{BlendComponent, BlendFactor, BlendOperation, BlendState};
+        let alpha_over = BlendComponent {
+            src_factor: BlendFactor::One,
+            dst_factor: BlendFactor::OneMinusSrcAlpha,
+            operation: BlendOperation::Add,
+        };
+        match self {
+            Blend2d::Alpha => Some(BlendState::ALPHA_BLENDING),
+            Blend2d::PremultipliedAlpha => Some(BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+            Blend2d::Additive => Some(BlendState {
+                color: BlendComponent {
+                    src_factor: BlendFactor::SrcAlpha,
+                    dst_factor: BlendFactor::One,
+                    operation: BlendOperation::Add,
+                },
+                alpha: alpha_over,
+            }),
+            Blend2d::Multiply => Some(BlendState {
+                color: BlendComponent {
+                    src_factor: BlendFactor::Dst,
+                    dst_factor: BlendFactor::Zero,
+                    operation: BlendOperation::Add,
+                },
+                alpha: alpha_over,
+            }),
+            Blend2d::Screen => Some(BlendState {
+                color: BlendComponent {
+                    src_factor: BlendFactor::One,
+                    dst_factor: BlendFactor::OneMinusSrc,
+                    operation: BlendOperation::Add,
+                },
+                alpha: alpha_over,
+            }),
+            Blend2d::Opaque => None,
+        }
+    }
+}
+
 /// Set of data identifying a scene node.
 pub struct ObjectData2d {
     material: Rc<RefCell<Box<dyn Material2d + 'static>>>,
@@ -27,6 +97,9 @@ pub struct ObjectData2d {
     points_use_perspective: bool,
     draw_surface: bool,
     cull: bool,
+    blend: Blend2d,
+    normal_map: Option<Arc<Texture>>,
+    lit_params: Option<crate::builtin::LitParams>,
     user_data: Box<dyn Any + 'static>,
 }
 
@@ -89,6 +162,26 @@ impl ObjectData2d {
     #[inline]
     pub fn backface_culling_enabled(&self) -> bool {
         self.cull
+    }
+
+    /// How this object's surface is composited over the framebuffer.
+    #[inline]
+    pub fn blend(&self) -> Blend2d {
+        self.blend
+    }
+
+    /// The normal map used when this object is drawn with
+    /// [`LitMaterial2d`](crate::builtin::LitMaterial2d), if any.
+    #[inline]
+    pub fn normal_map(&self) -> Option<&Arc<Texture>> {
+        self.normal_map.as_ref()
+    }
+
+    /// The per-object lighting parameters used by
+    /// [`LitMaterial2d`](crate::builtin::LitMaterial2d), if any.
+    #[inline]
+    pub fn lit_params(&self) -> Option<crate::builtin::LitParams> {
+        self.lit_params
     }
 
     /// An user-defined data.
@@ -160,6 +253,21 @@ pub const POINTS_COLOR_USE_OBJECT_2D: [f32; 4] = [0.0, 0.0, 0.0, 0.0];
 ///
 /// Contains GPU-allocated buffers for positions, deformations, colors,
 /// wireframe settings, and point settings of all 2D instances to be rendered.
+/// Raw per-instance GPU buffers prepared for direct compute writes (2D).
+///
+/// Returned by [`Object2d::instance_compute_buffers`] (and the matching
+/// [`SceneNode2d`](crate::scene::SceneNode2d) method). A compute shader running
+/// on the same `wgpu::Device` can fill these each frame instead of uploading
+/// per-instance data from the CPU via [`set_instances`](Object2d::set_instances).
+pub struct InstanceComputeBuffers2d {
+    /// One `Vec2` position per instance.
+    pub positions: wgpu::Buffer,
+    /// One RGBA color (`[f32; 4]`) per instance.
+    pub colors: wgpu::Buffer,
+    /// Two `Vec2` deformation-matrix columns per instance (4 floats / instance).
+    pub deformations: wgpu::Buffer,
+}
+
 pub struct InstancesBuffer2d {
     /// GPU buffer of instance positions.
     pub positions: GPUVec<Vec2>,
@@ -275,6 +383,9 @@ impl Object2d {
             points_use_perspective: true,
             draw_surface: true,
             cull: true,
+            blend: Blend2d::default(),
+            normal_map: None,
+            lit_params: None,
             material,
             user_data: Box::new(user_data),
         };
@@ -433,6 +544,28 @@ impl Object2d {
         *self.instances.borrow_mut().points_sizes.data_mut() = Some(points_size_data);
     }
 
+    /// Prepares this object's per-instance buffers to be written directly by a
+    /// compute shader, for `count` instances, and returns the raw GPU buffers.
+    ///
+    /// The 2D analogue of
+    /// [`Object3d::instance_compute_buffers`](crate::scene::Object3d::instance_compute_buffers):
+    /// the object renders `count` instances reading position/color/deformation
+    /// straight from these buffers, which the caller fills via a compute pass on
+    /// the same `wgpu::Device`. An alternative to
+    /// [`set_instances`](Self::set_instances); use one or the other per frame.
+    pub fn instance_compute_buffers(&mut self, count: usize) -> InstanceComputeBuffers2d {
+        let mut inst = self.instances.borrow_mut();
+        let positions = inst.positions.prepare_gpu_writable(count).clone();
+        let colors = inst.colors.prepare_gpu_writable(count).clone();
+        // Two Vec2 columns (a Mat2) per instance.
+        let deformations = inst.deformations.prepare_gpu_writable(count * 2).clone();
+        InstanceComputeBuffers2d {
+            positions,
+            colors,
+            deformations,
+        }
+    }
+
     /// Gets the data of this object.
     #[inline]
     pub fn data(&self) -> &ObjectData2d {
@@ -449,6 +582,53 @@ impl Object2d {
     #[inline]
     pub fn enable_backface_culling(&mut self, active: bool) {
         self.data.cull = active;
+    }
+
+    /// Sets how this object's surface is composited over the framebuffer.
+    ///
+    /// See [`Blend2d`] for the available modes. Defaults to [`Blend2d::Alpha`].
+    #[inline]
+    pub fn set_blend(&mut self, blend: Blend2d) {
+        self.data.blend = blend;
+    }
+
+    /// Returns how this object's surface is composited over the framebuffer.
+    #[inline]
+    pub fn blend(&self) -> Blend2d {
+        self.data.blend
+    }
+
+    /// Sets the normal map used when this object is drawn with
+    /// [`LitMaterial2d`](crate::builtin::LitMaterial2d). `None` makes the surface flat.
+    #[inline]
+    pub fn set_normal_map(&mut self, normal_map: Option<Arc<Texture>>) {
+        self.data.normal_map = normal_map;
+    }
+
+    /// Loads a normal map from a file and sets it on this object (see [`Self::set_normal_map`]).
+    #[inline]
+    pub fn set_normal_map_from_file(&mut self, path: &Path, name: &str) {
+        let texture = TextureManager::get_global_manager(|tm| tm.add(path, name));
+        self.set_normal_map(Some(texture));
+    }
+
+    /// Returns the normal map, if any.
+    #[inline]
+    pub fn normal_map(&self) -> Option<&Arc<Texture>> {
+        self.data.normal_map.as_ref()
+    }
+
+    /// Sets the per-object lighting parameters used by
+    /// [`LitMaterial2d`](crate::builtin::LitMaterial2d). Ignored by other materials.
+    #[inline]
+    pub fn set_lit_params(&mut self, params: Option<crate::builtin::LitParams>) {
+        self.data.lit_params = params;
+    }
+
+    /// Returns the per-object lighting parameters, if any.
+    #[inline]
+    pub fn lit_params(&self) -> Option<crate::builtin::LitParams> {
+        self.data.lit_params
     }
 
     /// Attaches user-defined data to this object.

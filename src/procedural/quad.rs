@@ -29,7 +29,6 @@ pub fn quad(width: f32, height: f32, usubdivs: usize, vsubdivs: usize) -> Render
     let mut quad = unit_quad(usubdivs, vsubdivs);
 
     let s = Vec3::new(width, height, 1.0);
-
     quad.scale_by(s);
 
     quad
