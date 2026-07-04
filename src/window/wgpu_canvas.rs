@@ -611,6 +611,16 @@ impl WgpuCanvas {
                         Action::Press,
                         Modifiers::empty(),
                     ));
+                    // Emit a Char event for single-character (printable) keys so
+                    // egui text fields receive text input. Skip when a command
+                    // modifier is held so shortcuts (e.g. Ctrl+A) don't insert text,
+                    // mirroring the native path which relies on winit's `text` field.
+                    let key_string = event.key();
+                    if !event.ctrl_key() && !event.meta_key() && key_string.chars().count() == 1 {
+                        if let Some(ch) = key_string.chars().next() {
+                            pending.borrow_mut().push(WindowEvent::Char(ch));
+                        }
+                    }
                 });
                 let _ = web_window
                     .add_event_listener_with_callback("keydown", closure.as_ref().unchecked_ref());
